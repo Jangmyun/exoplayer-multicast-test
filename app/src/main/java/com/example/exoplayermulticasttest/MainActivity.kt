@@ -1,5 +1,7 @@
 package com.example.exoplayermulticasttest
 
+import android.content.Context
+import android.net.wifi.WifiManager
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -18,10 +20,17 @@ import com.example.exoplayermulticasttest.ui.theme.ExoPlayerMulticastTestTheme
 
 class MainActivity : ComponentActivity() {
     private lateinit var player: ExoPlayer
+    private lateinit var multicastLock: WifiManager.MulticastLock
 
     @androidx.media3.common.util.UnstableApi
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+
+        // MulticastLock 생성 및 획득
+        val wifiManager = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+        multicastLock = wifiManager.createMulticastLock("udpMulticastLock")
+        multicastLock.setReferenceCounted(true)
+        multicastLock.acquire()
 
         val streamUri = "udp://@224.1.1.1:1234"
 
