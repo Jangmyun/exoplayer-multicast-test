@@ -13,7 +13,7 @@ class MulticastController(private val host: String, private val port: Int) {
             val multicastGroup = InetAddress.getByName(host)
             socket = MulticastSocket(port).apply {
                 reuseAddress = true
-                joinGroup(multicastGroup)
+                joinGroup(InetAddress.getByName(host))
                 soTimeout = 10000
             }
         } catch (e: Exception) {
