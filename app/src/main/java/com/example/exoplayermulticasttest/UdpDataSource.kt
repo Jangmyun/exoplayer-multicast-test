@@ -18,7 +18,7 @@ import java.net.SocketTimeoutException
 @androidx.media3.common.util.UnstableApi
 class UdpDataSource(
     private val uri: String,
-    private val bufferSize: Int = 200000
+    private val bufferSize: Int = 200_000
 ) : DataSource {
 
     companion object {

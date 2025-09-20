@@ -138,15 +138,16 @@ class MainActivity : ComponentActivity() {
             // 1. 버퍼링 정책을 관대하게 설정
             // 최소 30초, 최대 60초 분량의 데이터를 미리 확보하도록 설정하여 버퍼링 문제를 해결
             val loadControl = androidx.media3.exoplayer.DefaultLoadControl.Builder()
-                .setBufferDurationsMs(
-                    30_000, // Min buffer (ms)
-                    60_000, // Max buffer (ms)
-                    1_500,  // Buffer for playback to start (ms)
-                    2_000   // Buffer for playback after rebuffer (ms)
-                )
+//                .setBufferDurationsMs(
+//                    30_000, // Min buffer (ms)
+//                    60_000, // Max buffer (ms)
+//                    1_500,  // Buffer for playback to start (ms)
+//                    2_000   // Buffer for playback after rebuffer (ms)
+//                )
                 .build()
             Log.d(TAG, "Custom DefaultLoadControl created")
 
+            // 2. ExoPlayer 내장 UDP 소스를 사용하도록 MediaItem 생성 (URI에서 '@' 제거)
             // 2. ExoPlayer 내장 UDP 소스를 사용하도록 MediaItem 생성 (URI에서 '@' 제거)
             val mediaItem = MediaItem.fromUri("udp://224.1.1.1:1234")
             Log.d(
