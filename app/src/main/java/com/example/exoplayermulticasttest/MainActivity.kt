@@ -18,6 +18,7 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.media3.common.MediaItem
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
+import androidx.media3.datasource.UdpDataSource
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.ui.PlayerView
 import kotlinx.coroutines.CoroutineScope
@@ -44,7 +45,8 @@ class MainActivity : ComponentActivity() {
     data class PacketStats(
         val total: Long = 0,
         val lost: Long = 0,
-        val lossRate: Double = 0.0
+        val lossRate: Double = 0.0,
+        val throughputKbps: Double = 0.0
     )
 
     @androidx.media3.common.util.UnstableApi
@@ -71,7 +73,8 @@ class MainActivity : ComponentActivity() {
                 Text(
                     text = "Total: ${packetStats.value.total}, " +
                             "Lost: ${packetStats.value.lost}, " +
-                            "Loss: ${"%.4f".format(packetStats.value.lossRate)}%",
+                            "Loss: ${"%.4f".format(packetStats.value.lossRate)}%" +
+                            "Throughput: ${"%.2f".format(packetStats.value.throughputKbps)} Kbps",
                     modifier = Modifier.padding(16.dp)
                 )
             }
@@ -80,34 +83,36 @@ class MainActivity : ComponentActivity() {
 
     private fun startLossMonitor() {
         CoroutineScope(Dispatchers.IO).launch {
-            // ExoPlayer와 충돌을 피하기 위해 다른 포트를 사용하거나,
-            // ExoPlayer가 사용하는 포트와 동일한 포트를 사용하되 reuseAddress를 true로 설정합니다.
-            // 여기서는 동일 포트를 사용한다고 가정합니다.
             val socket = MulticastSocket(1234).apply {
-                reuseAddress = true // 다른 소켓과 포트를 공유할 수 있게 함
+                reuseAddress = true
             }
             val group = InetAddress.getByName("224.1.1.1")
             socket.joinGroup(group)
 
-            // 각 PID별로 마지막 CC(Continuity Counter)를 저장하는 맵
             val pidCcMap = mutableMapOf<Int, Int>()
             var totalPkt = 0L
             var lostPkt = 0L
             var remain = ByteArray(0)
 
-            val buf = ByteArray(4096) // UDP 패킷을 받기 위한 버퍼
+            val buf = ByteArray(4096)
             val udpPacket = DatagramPacket(buf, buf.size)
+
+            // ✅ 처리량 계산을 위한 변수 추가
+            var lastTimeMillis = System.currentTimeMillis()
+            var receivedBytes = 0L
+            var throughputKbps = 0.0
 
             try {
                 while (true) {
                     socket.receive(udpPacket)
-                    // 수신한 데이터와 이전에 남은 데이터를 합침
+
+                    // ✅ 수신된 바이트 누적
+                    receivedBytes += udpPacket.length.toLong()
+
                     val data = remain + udpPacket.data.copyOf(udpPacket.length)
                     var offset = 0
 
-                    // 188바이트 TS 패킷 단위로 처리
                     while (offset + 188 <= data.size) {
-                        // Sync Byte(0x47)를 찾아 패킷의 시작점을 맞춤
                         if (data[offset] != 0x47.toByte()) {
                             var nextSync = -1
                             for (i in offset + 1 until data.size) {
@@ -116,35 +121,30 @@ class MainActivity : ComponentActivity() {
                                     break
                                 }
                             }
-                            if (nextSync == -1) break // Sync Byte 없음
+                            if (nextSync == -1) break
                             offset = nextSync
                             continue
                         }
 
-                        // TS 패킷 (188 바이트) 추출
                         val tsPacket = data.copyOfRange(offset, offset + 188)
                         val pid =
                             ((tsPacket[1].toInt() and 0x1F) shl 8) or (tsPacket[2].toInt() and 0xFF)
                         val cc = tsPacket[3].toInt() and 0x0F
 
-                        // Null Packet (PID 8191)은 통계에서 제외
                         if (pid == 8191) {
                             offset += 188
                             continue
                         }
 
-                        totalPkt++ // 전체 패킷 수 증가
+                        totalPkt++
 
-                        // 이 PID가 처음 발견된 경우, 현재 CC를 기록하고 다음으로 넘어감
                         if (!pidCcMap.containsKey(pid)) {
                             pidCcMap[pid] = cc
                         } else {
                             val lastCc = pidCcMap[pid]!!
-                            // 예상되는 다음 CC 값 (15 다음은 0)
                             val expectedCc = (lastCc + 1) % 16
 
                             if (cc != expectedCc) {
-                                // CC가 예상과 다르면 패킷 손실 발생
                                 val lostCount = (cc - expectedCc + 16) % 16
                                 lostPkt += lostCount
                                 Log.w(
@@ -152,22 +152,30 @@ class MainActivity : ComponentActivity() {
                                     "Packet Loss Detected! PID: $pid, LastCC: $lastCc, CurrentCC: $cc, Lost: $lostCount"
                                 )
                             }
-                            // 현재 CC를 마지막 CC로 업데이트
                             pidCcMap[pid] = cc
                         }
 
                         offset += 188
                     }
-                    // 처리하고 남은 데이터를 다음 루프를 위해 저장
                     remain = if (offset < data.size) data.copyOfRange(
                         offset,
                         data.size
                     ) else ByteArray(0)
 
-                    // UI 업데이트 (메인 스레드에서)
+                    // ✅ 1초마다 처리량 업데이트
+                    val currentTimeMillis = System.currentTimeMillis()
+                    val elapsedTime = currentTimeMillis - lastTimeMillis
+                    if (elapsedTime >= 1000) {
+                        val bits = receivedBytes.toDouble() * 8
+                        throughputKbps = (bits / (elapsedTime / 1000.0)) / 1000.0
+                        receivedBytes = 0L
+                        lastTimeMillis = currentTimeMillis
+                    }
+
+                    // ✅ UI 업데이트 (메인 스레드에서 처리량 값 포함)
                     withContext(Dispatchers.Main) {
                         val lossRate = if (totalPkt > 0) 100.0 * lostPkt / totalPkt else 0.0
-                        packetStats.value = PacketStats(totalPkt, lostPkt, lossRate)
+                        packetStats.value = PacketStats(totalPkt, lostPkt, lossRate, throughputKbps)
                     }
                 }
             } catch (e: Exception) {
@@ -244,11 +252,18 @@ class MainActivity : ComponentActivity() {
             // 1. 버퍼링 정책을 관대하게 설정
             // 최소 30초, 최대 60초 분량의 데이터를 미리 확보하도록 설정하여 버퍼링 문제를 해결
             val loadControl = androidx.media3.exoplayer.DefaultLoadControl.Builder()
-//                .setBufferDurationsMs(
-//                    30_000, // Min buffer (ms)
-//                    60_000, // Max buffer (ms)
-//                    1_500,  // Buffer for playback to start (ms)
-//                    2_000   // Buffer for playback after rebuffer (ms)
+                .setBufferDurationsMs(
+                    30_000, // Min buffer (ms)
+                    60_000, // Max buffer (ms)
+                    1_500,  // Buffer for playback to start (ms)
+                    2_000   // Buffer for playback after rebuffer (ms)
+                )
+//                .setAllocator(
+//                    androidx.media3.exoplayer.upstream.DefaultAllocator(
+//                        true,
+//                        androidx.media3.common.C.DEFAULT_BUFFER_SEGMENT_SIZE,
+//                        2 * 1024 * 1024 // ✅ 최대 버퍼 크기 (2MB)
+//                    )
 //                )
                 .build()
             Log.d(TAG, "Custom DefaultLoadControl created")
