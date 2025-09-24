@@ -1,50 +1,73 @@
 package com.example.exoplayermulticasttest
 
+import android.content.ContentValues
 import android.content.Context
 import android.net.wifi.WifiManager
 import android.os.Bundle
+import android.os.Environment
+import android.provider.MediaStore
 import android.util.Log
+import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.material3.Button
 import androidx.compose.material3.Text
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.media3.common.MediaItem
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
+import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.ui.PlayerView
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.io.OutputStreamWriter
 import java.net.DatagramPacket
 import java.net.InetAddress
 import java.net.MulticastSocket
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
 class MainActivity : ComponentActivity() {
 
     private lateinit var player: ExoPlayer
     private lateinit var multicastLock: WifiManager.MulticastLock
-    private val packetStats = mutableStateOf(PacketStats())
 
+    private val analysisStats = mutableStateOf(PacketAnalysis())
+    private val isMonitoring = mutableStateOf(false)
+
+    private var analysisJob: Job? = null
+    private var csvWriter: OutputStreamWriter? = null // Correct type for MediaStore
 
     companion object {
         private const val TAG = "MainActivity"
-        private const val STREAM_URI = "udp://@224.1.1.1:1234"
+        private const val STREAM_URI = "udp://224.1.1.1:1234"
+        private const val MCAST_PORT = 1234
     }
 
-    data class PacketStats(
-        val total: Long = 0,
-        val lost: Long = 0,
+    data class PacketAnalysis(
+        val totalPackets: Long = 0,
+        val lostPackets: Long = 0,
         val lossRate: Double = 0.0,
-        val throughputKbps: Double = 0.0
+        val throughputMbps: Double = 0.0
     )
 
     @androidx.media3.common.util.UnstableApi
@@ -53,7 +76,6 @@ class MainActivity : ComponentActivity() {
 
         setupMulticastLock()
         setupExoPlayer()
-        startLossMonitor() // 패킷 로스 모니터 시작
 
         enableEdgeToEdge()
         setContent {
@@ -67,286 +89,232 @@ class MainActivity : ComponentActivity() {
                     },
                     modifier = Modifier.weight(1f)
                 )
-                // 패킷 통계 표시
-                Text(
-                    text = "Total: ${packetStats.value.total}, " +
-                            "Lost: ${packetStats.value.lost}, " +
-                            "Loss: ${"%.4f".format(packetStats.value.lossRate)}%" +
-                            "Throughput: ${"%.2f".format(packetStats.value.throughputKbps)} Kbps",
-                    modifier = Modifier.padding(16.dp)
-                )
-            }
-        }
-    }
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(16.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Text("Monitoring Status: ${if (isMonitoring.value) "Running" else "Stopped"}",
+                        color = if (isMonitoring.value) Color.Green else Color.Red,
+                        fontWeight = FontWeight.Bold
+                    )
+                    Text(text = "Total TS Packets: ${analysisStats.value.totalPackets}")
+                    Text(text = "Lost TS Packets: ${analysisStats.value.lostPackets}")
+                    Text(text = "Loss Rate: ${"%.4f".format(analysisStats.value.lossRate)} %")
+                    Text(text = "Throughput: ${"%.2f".format(analysisStats.value.throughputMbps)} Mbps")
 
-    private fun startLossMonitor() {
-        CoroutineScope(Dispatchers.IO).launch {
-            val socket = MulticastSocket(1234).apply {
-                reuseAddress = true
-            }
-            val group = InetAddress.getByName("224.1.1.1")
-            socket.joinGroup(group)
-
-            val pidCcMap = mutableMapOf<Int, Int>()
-            var totalPkt = 0L
-            var lostPkt = 0L
-            var remain = ByteArray(0)
-
-            val buf = ByteArray(4096)
-            val udpPacket = DatagramPacket(buf, buf.size)
-
-            var lastTimeMillis = System.currentTimeMillis()
-            var receivedBytes = 0L
-            var throughputKbps = 0.0
-
-            try {
-                while (true) {
-                    socket.receive(udpPacket)
-
-                    receivedBytes += udpPacket.length.toLong()
-
-                    val data = remain + udpPacket.data.copyOf(udpPacket.length)
-                    var offset = 0
-
-                    while (offset + 188 <= data.size) {
-                        if (data[offset] != 0x47.toByte()) {
-                            var nextSync = -1
-                            for (i in offset + 1 until data.size) {
-                                if (data[i] == 0x47.toByte()) {
-                                    nextSync = i
-                                    break
-                                }
-                            }
-                            if (nextSync == -1) break
-                            offset = nextSync
-                            continue
-                        }
-
-                        val tsPacket = data.copyOfRange(offset, offset + 188)
-                        val pid =
-                            ((tsPacket[1].toInt() and 0x1F) shl 8) or (tsPacket[2].toInt() and 0xFF)
-                        val cc = tsPacket[3].toInt() and 0x0F
-
-                        if (pid == 8191) {
-                            offset += 188
-                            continue
-                        }
-
-                        totalPkt++
-
-                        if (!pidCcMap.containsKey(pid)) {
-                            pidCcMap[pid] = cc
-                        } else {
-                            val lastCc = pidCcMap[pid]!!
-                            val expectedCc = (lastCc + 1) % 16
-
-                            if (cc != expectedCc) {
-                                val lostCount = (cc - expectedCc + 16) % 16
-                                lostPkt += lostCount
-                                Log.w(
-                                    TAG,
-                                    "Packet Loss Detected! PID: $pid, LastCC: $lastCc, CurrentCC: $cc, Lost: $lostCount"
-                                )
-                            }
-                            pidCcMap[pid] = cc
-                        }
-
-                        offset += 188
-                    }
-                    remain = if (offset < data.size) data.copyOfRange(
-                        offset,
-                        data.size
-                    ) else ByteArray(0)
-
-                    val currentTimeMillis = System.currentTimeMillis()
-                    val elapsedTime = currentTimeMillis - lastTimeMillis
-                    if (elapsedTime >= 1000) {
-                        val bits = receivedBytes.toDouble() * 8
-                        throughputKbps = (bits / (elapsedTime / 1000.0)) / 1000.0
-                        receivedBytes = 0L
-                        lastTimeMillis = currentTimeMillis
-                    }
-
-                    withContext(Dispatchers.Main) {
-                        val lossRate = if (totalPkt > 0) 100.0 * lostPkt / totalPkt else 0.0
-                        packetStats.value = PacketStats(totalPkt, lostPkt, lossRate, throughputKbps)
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceEvenly
+                    ) {
+                        Button(
+                            onClick = { startAnalysis() },
+                            enabled = !isMonitoring.value
+                        ) { Text("Start Monitoring") }
+                        Button(
+                            onClick = { stopAnalysis() },
+                            enabled = isMonitoring.value
+                        ) { Text("Stop Monitoring") }
                     }
                 }
-            } catch (e: Exception) {
-                Log.e(TAG, "Error in Loss Monitor", e)
-            } finally {
-                socket.leaveGroup(group)
-                socket.close()
             }
         }
     }
 
-    private fun checkNetworkEnvironment() {
-        val wifiManager = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
-        val wifiInfo = wifiManager.connectionInfo
+    private fun startAnalysis() {
+        if (isMonitoring.value) return
+        isMonitoring.value = true
+        Toast.makeText(this, "Starting analysis...", Toast.LENGTH_SHORT).show()
 
-        Log.i(TAG, "=== Network Environment ===")
-        Log.i(TAG, "WiFi connected: ${wifiManager.isWifiEnabled}")
-        Log.i(TAG, "WiFi SSID: ${wifiInfo.ssid}")
-        Log.i(TAG, "WiFi IP: ${wifiInfo.ipAddress}")
-        Log.i(TAG, "WiFi Signal: ${wifiInfo.rssi} dBm")
+        analysisStats.value = PacketAnalysis()
+        startCsvLogging()
+
+        analysisJob = CoroutineScope(Dispatchers.IO).launch {
+            runPacketAnalysis(this) // Pass the CoroutineScope
+        }
+    }
+
+    private fun stopAnalysis() {
+        if (!isMonitoring.value) return
+        isMonitoring.value = false
+        Toast.makeText(this, "Stopping analysis...", Toast.LENGTH_SHORT).show()
+
+        analysisJob?.cancel()
+        analysisJob = null
+
+        stopCsvLogging()
+    }
+
+    // This is the single, correct version of the function
+    private suspend fun runPacketAnalysis(scope: CoroutineScope) {
+        val socket = MulticastSocket(MCAST_PORT).apply { reuseAddress = true }
+        val group = InetAddress.getByName("224.1.1.1")
+        socket.joinGroup(group)
+
+        val pidCcMap = mutableMapOf<Int, Int>()
+        var totalPkt = 0L
+        var lostPkt = 0L
+        var remain = ByteArray(0)
+        var bytesThisSecond = 0L
+        var lastUpdateTime = System.currentTimeMillis()
+
+        val buf = ByteArray(4096)
+        val udpPacket = DatagramPacket(buf, buf.size)
+
+        try {
+            while (scope.isActive) { // Use scope.isActive
+                socket.receive(udpPacket)
+                val receivedBytes = udpPacket.length
+                bytesThisSecond += receivedBytes
+
+                val data = remain + udpPacket.data.copyOf(receivedBytes)
+                var offset = 0
+
+                while (offset + 188 <= data.size) {
+                    if (data[offset] != 0x47.toByte()) {
+                        var nextSync = -1
+                        for (i in offset + 1 until data.size) { if (data[i] == 0x47.toByte()) { nextSync = i; break } }
+                        if (nextSync == -1) break
+                        offset = nextSync
+                        continue
+                    }
+
+                    val tsPacket = data.copyOfRange(offset, offset + 188)
+                    val pid = ((tsPacket[1].toInt() and 0x1F) shl 8) or (tsPacket[2].toInt() and 0xFF)
+                    if (pid == 0x1FFF) { offset += 188; continue }
+                    totalPkt++
+                    val cc = tsPacket[3].toInt() and 0x0F
+
+                    if (pidCcMap.containsKey(pid)) {
+                        val lastCc = pidCcMap[pid]!!
+                        val expectedCc = (lastCc + 1) % 16
+                        if (cc != expectedCc) { lostPkt += (cc - expectedCc + 16) % 16 }
+                    }
+                    pidCcMap[pid] = cc
+                    offset += 188
+                }
+                remain = if (offset < data.size) data.copyOfRange(offset, data.size) else ByteArray(0)
+
+                val now = System.currentTimeMillis()
+                if (now - lastUpdateTime >= 1000) {
+                    val intervalSeconds = (now - lastUpdateTime) / 1000.0
+                    val throughputMbps = (bytesThisSecond * 8) / (intervalSeconds * 1_000_000)
+                    val lossRate = if (totalPkt > 0) 100.0 * lostPkt / totalPkt else 0.0
+
+                    withContext(Dispatchers.Main) {
+                        analysisStats.value = PacketAnalysis(totalPkt, lostPkt, lossRate, throughputMbps)
+                    }
+                    writeCsvLog(System.currentTimeMillis(), totalPkt, lostPkt, lossRate, throughputMbps)
+
+                    bytesThisSecond = 0L
+                    lastUpdateTime = now
+                }
+            }
+        } catch (e: Exception) {
+            if (scope.isActive) Log.e(TAG, "Error during packet analysis", e)
+        } finally {
+            socket.leaveGroup(group)
+            socket.close()
+            withContext(Dispatchers.Main) {
+                if (isMonitoring.value) {
+                    isMonitoring.value = false
+                    Toast.makeText(this@MainActivity, "Analysis stopped unexpectedly.", Toast.LENGTH_SHORT).show()
+                }
+            }
+        }
+    }
+
+    private fun startCsvLogging() {
+        val contentResolver = applicationContext.contentResolver
+        val contentValues = ContentValues().apply {
+            val timestamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.getDefault()).format(Date())
+            put(MediaStore.MediaColumns.DISPLAY_NAME, "multicast_stats_$timestamp.csv")
+            put(MediaStore.MediaColumns.MIME_TYPE, "text/csv")
+            put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS)
+        }
+        try {
+            val uri = contentResolver.insert(MediaStore.Files.getContentUri("external"), contentValues)
+            if (uri == null) {
+                Toast.makeText(this, "Error: Could not create file.", Toast.LENGTH_SHORT).show()
+                return
+            }
+            csvWriter = OutputStreamWriter(contentResolver.openOutputStream(uri))
+            csvWriter?.append("Timestamp,TotalPackets,LostPackets,LossRate(%),Throughput(Mbps)\n")
+            csvWriter?.flush()
+            val fileName = contentValues.getAsString(MediaStore.MediaColumns.DISPLAY_NAME)
+            Toast.makeText(this, "CSV logging started: $fileName", Toast.LENGTH_LONG).show()
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to start CSV logging with MediaStore", e)
+            csvWriter = null
+        }
+    }
+
+    private fun writeCsvLog(time: Long, total: Long, lost: Long, lossRate: Double, throughput: Double) {
+        csvWriter?.let {
+            try {
+                val timestamp = SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.getDefault()).format(Date(time))
+                val line = "$timestamp,$total,$lost,${"%.4f".format(lossRate)},${"%.2f".format(throughput)}\n"
+                it.append(line)
+                it.flush()
+            } catch (e: Exception) { Log.e(TAG, "Failed to write to CSV file", e) }
+        }
+    }
+
+    private fun stopCsvLogging() {
+        try {
+            csvWriter?.flush()
+            csvWriter?.close()
+            csvWriter = null
+            Toast.makeText(this, "CSV logging stopped.", Toast.LENGTH_SHORT).show()
+        } catch (e: Exception) { Log.e(TAG, "Failed to close CSV writer", e) }
     }
 
     private fun setupMulticastLock() {
-        Log.i(TAG, "=== Setting up MulticastLock ===")
-
         val wifiManager = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
         multicastLock = wifiManager.createMulticastLock("udpMulticastLock").apply {
             setReferenceCounted(true)
             acquire()
         }
-
-        Log.i(TAG, "MulticastLock acquired: ${multicastLock.isHeld}")
     }
-
-    private fun testMulticastReception() {
-        Log.i(TAG, "=== Testing Multicast Reception ===")
-
-        CoroutineScope(Dispatchers.IO).launch {
-            try {
-                val socket = MulticastSocket(1234)
-                socket.reuseAddress = true
-                socket.soTimeout = 5000 // 5초 타임아웃
-
-                val group = InetAddress.getByName("224.1.1.1")
-                socket.joinGroup(group)
-
-                Log.i(TAG, "Multicast socket created, waiting for packets...")
-
-                val buffer = ByteArray(1316)
-                val packet = DatagramPacket(buffer, buffer.size)
-
-                socket.receive(packet)
-                Log.i(TAG, "SUCCESS: Received ${packet.length} bytes from ${packet.address}")
-
-                socket.leaveGroup(group)
-                socket.close()
-
-            } catch (e: Exception) {
-                Log.e(TAG, "Multicast test FAILED: ${e.message}")
-                Log.e(TAG, "Possible causes:")
-                Log.e(TAG, "1. No stream being sent to 224.1.1.1:1234")
-                Log.e(TAG, "2. Router doesn't support multicast")
-                Log.e(TAG, "3. Network firewall blocking packets")
-            }
-        }
-    }
-
 
     @androidx.media3.common.util.UnstableApi
     private fun setupExoPlayer() {
-        Log.i(TAG, "=== Setting up ExoPlayer (Final Version with Custom Buffer) ===")
-
         try {
-            // 1. 버퍼링 정책을 관대하게 설정
-            // 최소 30초, 최대 60초 분량의 데이터를 미리 확보하도록 설정하여 버퍼링 문제를 해결
-            val loadControl = androidx.media3.exoplayer.DefaultLoadControl.Builder()
-//                .setBufferDurationsMs(
-//                    30_000, // Min buffer (ms)
-//                    60_000, // Max buffer (ms)
-//                    1_500,  // Buffer for playback to start (ms)
-//                    2_000   // Buffer for playback after rebuffer (ms)
-//                )
-//                .setAllocator(
-//                    androidx.media3.exoplayer.upstream.DefaultAllocator(
-//                        true,
-//                        androidx.media3.common.C.DEFAULT_BUFFER_SEGMENT_SIZE,
-//                        2 * 1024 * 1024 // ✅ 최대 버퍼 크기 (2MB)
-//                    )
-//                )
-                .build()
-            Log.d(TAG, "Custom DefaultLoadControl created")
-
-            // 2. ExoPlayer 내장 UDP 소스를 사용하도록 MediaItem 생성 (URI에서 '@' 제거)
-            val mediaItem = MediaItem.fromUri("udp://224.1.1.1:1234")
-            Log.d(
-                TAG,
-                "MediaItem created for internal UDP source: ${mediaItem.localConfiguration?.uri}"
-            )
-
-            // 3. ExoPlayer 빌드 시, 위에서 만든 커스텀 버퍼링 정책을 적용
-            player = ExoPlayer.Builder(this)
-                .setLoadControl(loadControl) // ✅ 커스텀 버퍼 설정 적용
-                .build()
-                .apply {
-                    addListener(createPlayerListener())
-                    setMediaItem(mediaItem)
-                    Log.i(TAG, "ExoPlayer prepared, starting playback...")
-                    prepare()
-                    playWhenReady = true
-                }
-
-            Log.i(TAG, "✅ ExoPlayer setup completed successfully (Final Version)")
-
+            val mediaItem = MediaItem.fromUri(STREAM_URI)
+            player = ExoPlayer.Builder(this).build().apply {
+                addListener(createPlayerListener())
+                setMediaItem(mediaItem)
+                prepare()
+                playWhenReady = true
+            }
         } catch (e: Exception) {
-            Log.e(TAG, "❌ ExoPlayer setup failed (Final Version)", e)
+            Log.e(TAG, "ExoPlayer setup failed", e)
         }
     }
 
     private fun createPlayerListener() = object : Player.Listener {
         override fun onPlayerError(error: PlaybackException) {
-            Log.e(TAG, "=== PLAYBACK ERROR ===")
-            Log.e(TAG, "Error code: ${error.errorCode}")
-            Log.e(TAG, "Error message: ${error.message}")
-            Log.e(TAG, "Cause: ${error.cause}")
-
-            when (error.errorCode) {
-                PlaybackException.ERROR_CODE_IO_NETWORK_CONNECTION_FAILED -> {
-                    Log.e(TAG, "DIAGNOSIS: Network connection failed")
-                    Log.e(TAG, "- Check if ffmpeg is running and sending to 224.1.1.1:1234")
-                    Log.e(TAG, "- Verify router supports multicast")
-                }
-
-                PlaybackException.ERROR_CODE_IO_NETWORK_CONNECTION_TIMEOUT -> {
-                    Log.e(TAG, "DIAGNOSIS: Network timeout")
-                    Log.e(TAG, "- Stream might be too slow or intermittent")
-                }
-
-                PlaybackException.ERROR_CODE_PARSING_CONTAINER_MALFORMED -> {
-                    Log.e(TAG, "DIAGNOSIS: Container parsing error")
-                    Log.e(TAG, "- Check MPEG-TS stream format")
-                }
-
-                else -> {
-                    Log.e(TAG, "DIAGNOSIS: Other error - ${error.errorCode}")
-                }
-            }
+            Log.e(TAG, "=== PLAYBACK ERROR: ${error.message}", error)
         }
-
         override fun onPlaybackStateChanged(playbackState: Int) {
             val stateString = when (playbackState) {
-                Player.STATE_IDLE -> "IDLE - Player created"
-                Player.STATE_BUFFERING -> "BUFFERING - Loading stream data..."
-                Player.STATE_READY -> "READY - ✅ Video playing successfully!"
-                Player.STATE_ENDED -> "ENDED - Stream finished"
-                else -> "UNKNOWN - $playbackState"
+                Player.STATE_IDLE -> "IDLE"
+                Player.STATE_BUFFERING -> "BUFFERING"
+                Player.STATE_READY -> "READY"
+                Player.STATE_ENDED -> "ENDED"
+                else -> "UNKNOWN"
             }
             Log.i(TAG, "=== PLAYBACK STATE: $stateString ===")
-        }
-
-        override fun onIsLoadingChanged(isLoading: Boolean) {
-            Log.d(TAG, "Loading state: $isLoading")
-        }
-
-        override fun onVideoSizeChanged(videoSize: androidx.media3.common.VideoSize) {
-            Log.i(TAG, "🎥 Video resolution detected: ${videoSize.width}x${videoSize.height}")
         }
     }
 
     override fun onDestroy() {
         super.onDestroy()
-        Log.i(TAG, "=== App Destroyed ===")
-
+        stopAnalysis()
         player.release()
-
         if (multicastLock.isHeld) {
             multicastLock.release()
-            Log.d(TAG, "MulticastLock released")
         }
     }
 }
