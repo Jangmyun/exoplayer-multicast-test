@@ -32,7 +32,6 @@ class MainActivity : ComponentActivity() {
 
     private lateinit var player: ExoPlayer
     private lateinit var multicastLock: WifiManager.MulticastLock
-
     private val packetStats = mutableStateOf(PacketStats())
 
 
@@ -96,7 +95,6 @@ class MainActivity : ComponentActivity() {
             val buf = ByteArray(4096)
             val udpPacket = DatagramPacket(buf, buf.size)
 
-            // ✅ 처리량 계산을 위한 변수 추가
             var lastTimeMillis = System.currentTimeMillis()
             var receivedBytes = 0L
             var throughputKbps = 0.0
@@ -105,7 +103,6 @@ class MainActivity : ComponentActivity() {
                 while (true) {
                     socket.receive(udpPacket)
 
-                    // ✅ 수신된 바이트 누적
                     receivedBytes += udpPacket.length.toLong()
 
                     val data = remain + udpPacket.data.copyOf(udpPacket.length)
@@ -161,7 +158,6 @@ class MainActivity : ComponentActivity() {
                         data.size
                     ) else ByteArray(0)
 
-                    // ✅ 1초마다 처리량 업데이트
                     val currentTimeMillis = System.currentTimeMillis()
                     val elapsedTime = currentTimeMillis - lastTimeMillis
                     if (elapsedTime >= 1000) {
@@ -171,7 +167,6 @@ class MainActivity : ComponentActivity() {
                         lastTimeMillis = currentTimeMillis
                     }
 
-                    // ✅ UI 업데이트 (메인 스레드에서 처리량 값 포함)
                     withContext(Dispatchers.Main) {
                         val lossRate = if (totalPkt > 0) 100.0 * lostPkt / totalPkt else 0.0
                         packetStats.value = PacketStats(totalPkt, lostPkt, lossRate, throughputKbps)
@@ -251,12 +246,12 @@ class MainActivity : ComponentActivity() {
             // 1. 버퍼링 정책을 관대하게 설정
             // 최소 30초, 최대 60초 분량의 데이터를 미리 확보하도록 설정하여 버퍼링 문제를 해결
             val loadControl = androidx.media3.exoplayer.DefaultLoadControl.Builder()
-                .setBufferDurationsMs(
-                    30_000, // Min buffer (ms)
-                    60_000, // Max buffer (ms)
-                    1_500,  // Buffer for playback to start (ms)
-                    2_000   // Buffer for playback after rebuffer (ms)
-                )
+//                .setBufferDurationsMs(
+//                    30_000, // Min buffer (ms)
+//                    60_000, // Max buffer (ms)
+//                    1_500,  // Buffer for playback to start (ms)
+//                    2_000   // Buffer for playback after rebuffer (ms)
+//                )
 //                .setAllocator(
 //                    androidx.media3.exoplayer.upstream.DefaultAllocator(
 //                        true,
@@ -267,7 +262,6 @@ class MainActivity : ComponentActivity() {
                 .build()
             Log.d(TAG, "Custom DefaultLoadControl created")
 
-            // 2. ExoPlayer 내장 UDP 소스를 사용하도록 MediaItem 생성 (URI에서 '@' 제거)
             // 2. ExoPlayer 내장 UDP 소스를 사용하도록 MediaItem 생성 (URI에서 '@' 제거)
             val mediaItem = MediaItem.fromUri("udp://224.1.1.1:1234")
             Log.d(
