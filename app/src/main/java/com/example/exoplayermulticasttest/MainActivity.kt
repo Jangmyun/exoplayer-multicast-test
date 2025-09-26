@@ -20,7 +20,6 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.Button
 import androidx.compose.material3.Text
 import androidx.compose.runtime.mutableStateOf
-import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
@@ -29,7 +28,6 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.media3.common.MediaItem
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
-import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.ui.PlayerView
 import kotlinx.coroutines.CoroutineScope
@@ -62,7 +60,6 @@ class MainActivity : ComponentActivity() {
         private const val STREAM_URI = "udp://224.1.1.1:1234"
         private const val MCAST_PORT = 1234
     }
-
     data class PacketAnalysis(
         val totalPackets: Long = 0,
         val lostPackets: Long = 0,
@@ -95,7 +92,8 @@ class MainActivity : ComponentActivity() {
                         .padding(16.dp),
                     verticalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
-                    Text("Monitoring Status: ${if (isMonitoring.value) "Running" else "Stopped"}",
+                    Text(
+                        "Monitoring Status: ${if (isMonitoring.value) "Running" else "Stopped"}",
                         color = if (isMonitoring.value) Color.Green else Color.Red,
                         fontWeight = FontWeight.Bold
                     )
@@ -174,38 +172,55 @@ class MainActivity : ComponentActivity() {
                 while (offset + 188 <= data.size) {
                     if (data[offset] != 0x47.toByte()) {
                         var nextSync = -1
-                        for (i in offset + 1 until data.size) { if (data[i] == 0x47.toByte()) { nextSync = i; break } }
+                        for (i in offset + 1 until data.size) {
+                            if (data[i] == 0x47.toByte()) {
+                                nextSync = i; break
+                            }
+                        }
                         if (nextSync == -1) break
                         offset = nextSync
                         continue
                     }
 
                     val tsPacket = data.copyOfRange(offset, offset + 188)
-                    val pid = ((tsPacket[1].toInt() and 0x1F) shl 8) or (tsPacket[2].toInt() and 0xFF)
-                    if (pid == 0x1FFF) { offset += 188; continue }
+                    val pid =
+                        ((tsPacket[1].toInt() and 0x1F) shl 8) or (tsPacket[2].toInt() and 0xFF)
+                    if (pid == 0x1FFF) {
+                        offset += 188; continue
+                    }
                     totalPkt++
                     val cc = tsPacket[3].toInt() and 0x0F
 
                     if (pidCcMap.containsKey(pid)) {
                         val lastCc = pidCcMap[pid]!!
                         val expectedCc = (lastCc + 1) % 16
-                        if (cc != expectedCc) { lostPkt += (cc - expectedCc + 16) % 16 }
+                        if (cc != expectedCc) {
+                            lostPkt += (cc - expectedCc + 16) % 16
+                        }
                     }
                     pidCcMap[pid] = cc
                     offset += 188
                 }
-                remain = if (offset < data.size) data.copyOfRange(offset, data.size) else ByteArray(0)
+                remain =
+                    if (offset < data.size) data.copyOfRange(offset, data.size) else ByteArray(0)
 
                 val now = System.currentTimeMillis()
-                if (now - lastUpdateTime >= 1000) {
+                if (now - lastUpdateTime >= 100) {
                     val intervalSeconds = (now - lastUpdateTime) / 1000.0
                     val throughputMbps = (bytesThisSecond * 8) / (intervalSeconds * 1_000_000)
                     val lossRate = if (totalPkt > 0) 100.0 * lostPkt / totalPkt else 0.0
 
                     withContext(Dispatchers.Main) {
-                        analysisStats.value = PacketAnalysis(totalPkt, lostPkt, lossRate, throughputMbps)
+                        analysisStats.value =
+                            PacketAnalysis(totalPkt, lostPkt, lossRate, throughputMbps)
                     }
-                    writeCsvLog(System.currentTimeMillis(), totalPkt, lostPkt, lossRate, throughputMbps)
+                    writeCsvLog(
+                        System.currentTimeMillis(),
+                        totalPkt,
+                        lostPkt,
+                        lossRate,
+                        throughputMbps
+                    )
 
                     bytesThisSecond = 0L
                     lastUpdateTime = now
@@ -219,7 +234,11 @@ class MainActivity : ComponentActivity() {
             withContext(Dispatchers.Main) {
                 if (isMonitoring.value) {
                     isMonitoring.value = false
-                    Toast.makeText(this@MainActivity, "Analysis stopped unexpectedly.", Toast.LENGTH_SHORT).show()
+                    Toast.makeText(
+                        this@MainActivity,
+                        "Analysis stopped unexpectedly.",
+                        Toast.LENGTH_SHORT
+                    ).show()
                 }
             }
         }
@@ -234,7 +253,8 @@ class MainActivity : ComponentActivity() {
             put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS)
         }
         try {
-            val uri = contentResolver.insert(MediaStore.Files.getContentUri("external"), contentValues)
+            val uri =
+                contentResolver.insert(MediaStore.Files.getContentUri("external"), contentValues)
             if (uri == null) {
                 Toast.makeText(this, "Error: Could not create file.", Toast.LENGTH_SHORT).show()
                 return
@@ -250,14 +270,26 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun writeCsvLog(time: Long, total: Long, lost: Long, lossRate: Double, throughput: Double) {
+    private fun writeCsvLog(
+        time: Long,
+        total: Long,
+        lost: Long,
+        lossRate: Double,
+        throughput: Double
+    ) {
         csvWriter?.let {
             try {
-                val timestamp = SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.getDefault()).format(Date(time))
-                val line = "$timestamp,$total,$lost,${"%.4f".format(lossRate)},${"%.2f".format(throughput)}\n"
+                val timestamp =
+                    SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.getDefault()).format(
+                        Date(time)
+                    )
+                val line =
+                    "$timestamp,$total,$lost,${"%.4f".format(lossRate)},${"%.2f".format(throughput)}\n"
                 it.append(line)
                 it.flush()
-            } catch (e: Exception) { Log.e(TAG, "Failed to write to CSV file", e) }
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to write to CSV file", e)
+            }
         }
     }
 
@@ -267,7 +299,9 @@ class MainActivity : ComponentActivity() {
             csvWriter?.close()
             csvWriter = null
             Toast.makeText(this, "CSV logging stopped.", Toast.LENGTH_SHORT).show()
-        } catch (e: Exception) { Log.e(TAG, "Failed to close CSV writer", e) }
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to close CSV writer", e)
+        }
     }
 
     private fun setupMulticastLock() {
@@ -297,6 +331,7 @@ class MainActivity : ComponentActivity() {
         override fun onPlayerError(error: PlaybackException) {
             Log.e(TAG, "=== PLAYBACK ERROR: ${error.message}", error)
         }
+
         override fun onPlaybackStateChanged(playbackState: Int) {
             val stateString = when (playbackState) {
                 Player.STATE_IDLE -> "IDLE"
