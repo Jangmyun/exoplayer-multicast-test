@@ -247,10 +247,22 @@ class MainActivity : ComponentActivity() {
         } catch (e: Exception) {
             if (scope.isActive) Log.e(TAG, "Error during packet analysis", e)
         } finally {
-            if (socket is MulticastSocket) {
-                socket.leaveGroup(address)
+            try {
+                // 소켓이 MulticastSocket 인스턴스일 경우에만 그룹에서 떠나는 로직 수행
+                if (socket is MulticastSocket) {
+                    // address 또한 멀티캐스트 주소일 때만 leaveGroup을 호출하도록 추가 검사
+                    if (address.isMulticastAddress) {
+                        socket.leaveGroup(address)
+                    }
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "Error trying to leave multicast group", e)
+            } finally {
+                // 어떤 경우에도 소켓은 반드시 닫도록 보장
+                socket.close()
             }
-            socket.close()
+            // ✅ 수정된 부분 끝
+
             withContext(Dispatchers.Main) {
                 if (isMonitoring.value) {
                     isMonitoring.value = false
