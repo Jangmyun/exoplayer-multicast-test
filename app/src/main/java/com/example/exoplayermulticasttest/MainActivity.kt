@@ -12,12 +12,14 @@ import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.material3.Button
 import androidx.compose.material3.Text
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
@@ -26,7 +28,9 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.media3.common.MediaItem
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
+import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.upstream.DefaultAllocator
 import androidx.media3.ui.PlayerView
 import kotlinx.coroutines.*
 import java.io.OutputStreamWriter
@@ -36,7 +40,7 @@ import java.util.*
 
 class MainActivity : ComponentActivity() {
 
-    private lateinit var player: ExoPlayer
+    private var player: ExoPlayer? = null // Nullable로 변경하여 비활성화 상태 표현
     private lateinit var multicastLock: WifiManager.MulticastLock
 
     private val analysisStats = mutableStateOf(PacketAnalysis())
@@ -48,9 +52,12 @@ class MainActivity : ComponentActivity() {
     companion object {
         private const val TAG = "MainActivity"
         private const val MULTICAST_URI = "udp://224.1.1.1:1234"
-        private const val UNICAST_URI = "udp://192.168.0.159:1234"
+        // 유니캐스트 모니터링은 포트만 중요하므로 IP는 0.0.0.0 사용
+        private const val UNICAST_MONITOR_URI = "udp://0.0.0.0:1234"
+        private const val MCAST_PORT = 1234
     }
 
+    // 현재 스트림 모드를 관리하는 상태 변수
     private var streamUri by mutableStateOf(MULTICAST_URI)
 
     data class PacketAnalysis(
@@ -65,47 +72,51 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
 
         setupMulticastLock()
+        // 앱 시작 시 기본값인 멀티캐스트로 플레이어 설정
         setupExoPlayer()
 
         enableEdgeToEdge()
         setContent {
             Column(modifier = Modifier.fillMaxSize()) {
-                AndroidView(
-                    factory = { context ->
-                        PlayerView(context).apply {
-                            this.player = this@MainActivity.player
-                            useController = true
-                        }
-                    },
-                    modifier = Modifier.weight(1f)
-                )
-
-                // 토글 버튼 UI
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(16.dp),
-                    horizontalArrangement = Arrangement.SpaceEvenly
-                ) {
-                    Button(onClick = { switchStream(MULTICAST_URI) }) {
-                        Text("Multicast")
-                    }
-                    Button(onClick = { switchStream(UNICAST_URI) }) {
-                        Text("Unicast")
+                // 스트림 모드에 따라 PlayerView 또는 안내 문구 표시
+                Box(modifier = Modifier.weight(1f).fillMaxWidth().background(Color.Black)) {
+                    // player가 null이 아닐 때만 PlayerView를 렌더링
+                    if (player != null && streamUri == MULTICAST_URI) {
+                        AndroidView(
+                            factory = { context ->
+                                PlayerView(context).apply {
+                                    this.player = this@MainActivity.player
+                                    useController = true
+                                }
+                            },
+                            modifier = Modifier.fillMaxSize()
+                        )
+                    } else {
+                        Text(
+                            "Player is disabled in Unicast monitoring mode.",
+                            color = Color.White,
+                            modifier = Modifier.align(Alignment.Center)
+                        )
                     }
                 }
 
+                // --- UI Controls ---
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
+                    horizontalArrangement = Arrangement.SpaceEvenly
+                ) {
+                    Button(onClick = { switchStream(MULTICAST_URI) }) { Text("Multicast Mode") }
+                    Button(onClick = { switchStream(UNICAST_MONITOR_URI) }) { Text("Unicast Mode") }
+                }
                 Text(
-                    text = "Current Stream: $streamUri",
-                    modifier = Modifier.padding(16.dp),
+                    text = "Current Mode: ${if (streamUri == MULTICAST_URI) "Multicast" else "Unicast"}",
+                    modifier = Modifier.padding(horizontal = 16.dp),
                     fontWeight = FontWeight.Bold
                 )
 
-                // 모니터링 정보 + 제어 버튼
+                // 모니터링 정보 UI
                 Column(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(16.dp),
+                    modifier = Modifier.fillMaxWidth().padding(16.dp),
                     verticalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
                     Text(
@@ -117,22 +128,54 @@ class MainActivity : ComponentActivity() {
                     Text(text = "Lost TS Packets: ${analysisStats.value.lostPackets}")
                     Text(text = "Loss Rate: ${"%.4f".format(analysisStats.value.lossRate)} %")
                     Text(text = "Throughput: ${"%.2f".format(analysisStats.value.throughputMbps)} Mbps")
-
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.SpaceEvenly
                     ) {
-                        Button(
-                            onClick = { startAnalysis() },
-                            enabled = !isMonitoring.value
-                        ) { Text("Start Monitoring") }
-                        Button(
-                            onClick = { stopAnalysis() },
-                            enabled = isMonitoring.value
-                        ) { Text("Stop Monitoring") }
+                        Button(onClick = { startAnalysis() }, enabled = !isMonitoring.value) { Text("Start Monitoring") }
+                        Button(onClick = { stopAnalysis() }, enabled = isMonitoring.value) { Text("Stop Monitoring") }
                     }
                 }
             }
+        }
+    }
+
+    @androidx.media3.common.util.UnstableApi
+    private fun switchStream(newUri: String) {
+        if (isMonitoring.value) {
+            stopAnalysis()
+        }
+
+        streamUri = newUri
+        player?.release() // Null-safe release
+        player = null // 플레이어 비활성화
+
+        if (newUri == MULTICAST_URI) {
+            setupExoPlayer()
+            Toast.makeText(this, "Switched to Multicast. Player is active.", Toast.LENGTH_SHORT).show()
+        } else {
+            Toast.makeText(this, "Switched to Unicast. Player is disabled.", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    @androidx.media3.common.util.UnstableApi
+    private fun setupExoPlayer() {
+        try {
+            val loadControl = DefaultLoadControl.Builder()
+                .setAllocator(DefaultAllocator(true, 65536, 2 * 1024 * 1024)).build()
+
+            val mediaItem = MediaItem.fromUri(streamUri)
+            player = ExoPlayer.Builder(this)
+                .setLoadControl(loadControl)
+                .build()
+                .apply {
+                    addListener(createPlayerListener())
+                    setMediaItem(mediaItem)
+                    prepare()
+                    playWhenReady = true
+                }
+        } catch (e: Exception) {
+            Log.e(TAG, "ExoPlayer setup failed", e)
         }
     }
 
@@ -160,30 +203,39 @@ class MainActivity : ComponentActivity() {
         stopCsvLogging()
     }
 
-    private fun isMulticastAddress(address: InetAddress): Boolean {
-        return address.isMulticastAddress
-    }
-
     private suspend fun runPacketAnalysis(scope: CoroutineScope) {
         val uri = Uri.parse(streamUri)
-        val host = uri.host ?: "224.1.1.1"
-        val port = if (uri.port > 0) uri.port else 1234
+        val host = uri.host ?: "0.0.0.0" // 기본값을 0.0.0.0으로 변경
+        val port = if (uri.port > 0) uri.port else MCAST_PORT
         val address = InetAddress.getByName(host)
 
-        val socket: DatagramSocket = if (isMulticastAddress(address)) {
-            MulticastSocket(port).apply {
-                reuseAddress = true
-                joinGroup(address)
+        val socket: DatagramSocket? = try {
+            if (address.isMulticastAddress) {
+                MulticastSocket(port).apply {
+                    reuseAddress = true
+                    joinGroup(address)
+                }
+            } else { // Unicast
+                DatagramSocket(port).apply { reuseAddress = true }
             }
-        } else {
-            DatagramSocket(port).apply { reuseAddress = true }
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to create socket on port $port.", e)
+            withContext(Dispatchers.Main) {
+                Toast.makeText(this@MainActivity, "Error: Failed to open port $port. Is player active?", Toast.LENGTH_LONG).show()
+            }
+            null
+        }
+
+        if (socket == null) {
+            withContext(Dispatchers.Main) { stopAnalysis() }
+            return
         }
 
         val pidCcMap = mutableMapOf<Int, Int>()
         var totalPkt = 0L
         var lostPkt = 0L
         var remain = ByteArray(0)
-        var bytesThisSecond = 0L
+        var bytesInInterval = 0L
         var lastUpdateTime = System.currentTimeMillis()
 
         val buf = ByteArray(4096)
@@ -193,7 +245,7 @@ class MainActivity : ComponentActivity() {
             while (scope.isActive) {
                 socket.receive(udpPacket)
                 val receivedBytes = udpPacket.length
-                bytesThisSecond += receivedBytes
+                bytesInInterval += receivedBytes
 
                 val data = remain + udpPacket.data.copyOf(receivedBytes)
                 var offset = 0
@@ -213,7 +265,9 @@ class MainActivity : ComponentActivity() {
 
                     val tsPacket = data.copyOfRange(offset, offset + 188)
                     val pid = ((tsPacket[1].toInt() and 0x1F) shl 8) or (tsPacket[2].toInt() and 0xFF)
-                    if (pid == 0x1FFF) { offset += 188; continue }
+                    if (pid == 0x1FFF) {
+                        offset += 188; continue
+                    }
                     totalPkt++
                     val cc = tsPacket[3].toInt() and 0x0F
 
@@ -232,7 +286,11 @@ class MainActivity : ComponentActivity() {
                 val now = System.currentTimeMillis()
                 if (now - lastUpdateTime >= 100) {
                     val intervalSeconds = (now - lastUpdateTime) / 1000.0
-                    val throughputMbps = (bytesThisSecond * 8) / (intervalSeconds * 1_000_000)
+                    val throughputMbps = if (intervalSeconds > 0) {
+                        (bytesInInterval * 8) / (intervalSeconds * 1_000_000)
+                    } else {
+                        0.0
+                    }
                     val lossRate = if (totalPkt > 0) 100.0 * lostPkt / totalPkt else 0.0
 
                     withContext(Dispatchers.Main) {
@@ -240,7 +298,7 @@ class MainActivity : ComponentActivity() {
                     }
                     writeCsvLog(System.currentTimeMillis(), totalPkt, lostPkt, lossRate, throughputMbps)
 
-                    bytesThisSecond = 0L
+                    bytesInInterval = 0L
                     lastUpdateTime = now
                 }
             }
@@ -248,21 +306,13 @@ class MainActivity : ComponentActivity() {
             if (scope.isActive) Log.e(TAG, "Error during packet analysis", e)
         } finally {
             try {
-                // 소켓이 MulticastSocket 인스턴스일 경우에만 그룹에서 떠나는 로직 수행
-                if (socket is MulticastSocket) {
-                    // address 또한 멀티캐스트 주소일 때만 leaveGroup을 호출하도록 추가 검사
-                    if (address.isMulticastAddress) {
-                        socket.leaveGroup(address)
-                    }
+                if (socket is MulticastSocket && address.isMulticastAddress) {
+                    socket.leaveGroup(address)
                 }
             } catch (e: Exception) {
-                Log.w(TAG, "Error trying to leave multicast group", e)
-            } finally {
-                // 어떤 경우에도 소켓은 반드시 닫도록 보장
-                socket.close()
+                Log.w(TAG, "Error leaving multicast group", e)
             }
-            // ✅ 수정된 부분 끝
-
+            socket.close()
             withContext(Dispatchers.Main) {
                 if (isMonitoring.value) {
                     isMonitoring.value = false
@@ -325,29 +375,6 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    @androidx.media3.common.util.UnstableApi
-    private fun setupExoPlayer() {
-        try {
-            val mediaItem = MediaItem.fromUri(streamUri)
-            player = ExoPlayer.Builder(this).build().apply {
-                addListener(createPlayerListener())
-                setMediaItem(mediaItem)
-                prepare()
-                playWhenReady = true
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "ExoPlayer setup failed", e)
-        }
-    }
-
-    @androidx.media3.common.util.UnstableApi
-    private fun switchStream(newUri: String) {
-        streamUri = newUri
-        player.release()
-        setupExoPlayer()
-        Toast.makeText(this, "Switched to $newUri", Toast.LENGTH_SHORT).show()
-    }
-
     private fun createPlayerListener() = object : Player.Listener {
         override fun onPlayerError(error: PlaybackException) {
             Log.e(TAG, "=== PLAYBACK ERROR: ${error.message}", error)
@@ -360,14 +387,14 @@ class MainActivity : ComponentActivity() {
                 Player.STATE_ENDED -> "ENDED"
                 else -> "UNKNOWN"
             }
-            Log.i(TAG, "=== PLAYBACK STATE: $stateString ===")
+            Log.i(TAG, "=== PLAYBACK STATE: $stateString ====")
         }
     }
 
     override fun onDestroy() {
         super.onDestroy()
         stopAnalysis()
-        player.release()
+        player?.release()
         if (multicastLock.isHeld) {
             multicastLock.release()
         }
